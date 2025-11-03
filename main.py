@@ -5,17 +5,14 @@ import telebot
 from datetime import datetime
 import pytz
 
-# === Настройки ===
-CHECK_INTERVAL = 60  # проверка каждые 60 секунд
+CHECK_INTERVAL = 60
 TIMEZONE = "UTC+1"
 
-# Получаем токен и ID чата из Railway Environment Variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# === Валютные пары ===
 PAIRS = [
     "EUR/USD", "GBP/AUD", "GBP/CHF", "GBP/USD", "USD/CHF", "USD/JPY",
     "GBP/CAD", "AUD/CAD", "AUD/USD", "USD/CAD", "GBP/JPY", "EUR/JPY",
@@ -23,56 +20,57 @@ PAIRS = [
     "EUR/CAD", "EUR/CHF", "EUR/GBP"
 ]
 
-# === Получение цены с 3 источников ===
+# === Функция получения цены с разных источников ===
 def get_price(symbol):
-    """Проверяет цену на Bitget, Binance и Coinbase"""
     base, quote = symbol.split("/")
-    symbols_to_try = [
-        f"{base}{quote}",
-        f"{base}{quote}T",
-        f"{base}{quote}USDT",
-        f"{base}-{quote}",
-        f"{base}-{quote}-USD"
+    variants = [
+        f"{base}{quote}", f"{base}{quote}USDT", f"{base}-{quote}", f"{base}-{quote}-USD",
+        f"{base}{quote}_SPBL", f"{base}{quote}_UMCBL"
     ]
 
-    # --- 1. Bitget ---
-    for s in symbols_to_try:
+    # --- Bitget ---
+    for s in variants:
         try:
             r = requests.get("https://api.bitget.com/api/v2/market/ticker", params={"symbol": s}, timeout=3)
-            if r.status_code == 200 and "data" in r.json() and isinstance(r.json()["data"], dict):
-                return float(r.json()["data"]["lastPr"])
+            data = r.json()
+            if r.status_code == 200 and "data" in data and isinstance(data["data"], dict):
+                price = float(data["data"].get("lastPr", 0))
+                if price > 0:
+                    return price
         except:
             pass
 
-    # --- 2. Binance ---
-    for s in symbols_to_try:
+    # --- Binance ---
+    for s in [f"{base}{quote}", f"{base}{quote}USDT"]:
         try:
-            r = requests.get(f"https://api.binance.com/api/v3/ticker/price", params={"symbol": s}, timeout=3)
-            if r.status_code == 200 and "price" in r.json():
-                return float(r.json()["price"])
+            r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": s}, timeout=3)
+            data = r.json()
+            if r.status_code == 200 and "price" in data:
+                return float(data["price"])
         except:
             pass
 
-    # --- 3. Coinbase ---
+    # --- Coinbase ---
     for s in [f"{base}-{quote}", f"{base}-{quote}-USD"]:
         try:
             r = requests.get(f"https://api.exchange.coinbase.com/products/{s}/ticker", timeout=3)
-            if r.status_code == 200 and "price" in r.json():
-                return float(r.json()["price"])
+            data = r.json()
+            if r.status_code == 200 and "price" in data:
+                return float(data["price"])
         except:
             pass
 
     print(f"⚠️ Не удалось получить цену для {symbol}")
     return None
 
-# === Пример уровней (заглушка) ===
+
 def get_high_low(symbol, hours=24):
     price = get_price(symbol)
     if price:
         return price * 0.995, price * 1.005
     return None, None
 
-# === Проверка уровней ===
+
 def check_levels():
     tz = pytz.timezone("Europe/Berlin")
     now = datetime.now(tz)
@@ -112,7 +110,7 @@ def check_levels():
             bot.send_message(TELEGRAM_CHAT_ID, msg)
             print(msg)
 
-# === Проверка Telegram токена ===
+
 def test_token():
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe")
@@ -123,7 +121,7 @@ def test_token():
         print(f"❌ Ошибка проверки токена: {e}")
     return False
 
-# === Основной процесс ===
+
 def main():
     if not test_token():
         print("❌ Неверный Telegram токен.")
@@ -145,6 +143,7 @@ def main():
             time.sleep(CHECK_INTERVAL)
 
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
 
 if __name__ == "__main__":
     main()
