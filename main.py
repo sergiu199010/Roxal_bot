@@ -2,7 +2,6 @@ import os
 import time
 import requests
 import telebot
-import asyncio
 from datetime import datetime, timedelta
 
 # === Настройки ===
@@ -10,94 +9,74 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EXCHANGE = os.getenv("EXCHANGE", "bitget")
 
+# Проверка токена перед запуском
+def check_token_validity(token):
+    try:
+        test_url = f"https://api.telegram.org/bot{token}/getMe"
+        response = requests.get(test_url, timeout=10)
+        if response.status_code == 200 and response.json().get("ok"):
+            print("✅ Telegram токен действителен. Продолжаю запуск.")
+            return True
+        else:
+            print(f"❌ Ошибка: неверный Telegram токен ({response.status_code}).")
+            return False
+    except Exception as e:
+        print(f"⚠️ Ошибка проверки токена: {e}")
+        return False
+
+if not TELEGRAM_TOKEN or not check_token_validity(TELEGRAM_TOKEN):
+    print("⛔ Бот не запущен. Проверь токен TELEGRAM_TOKEN в Railway.")
+    exit()
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 # === Валютные пары ===
 PAIRS = [
     "EUR/USD", "GBP/AUD", "GBP/CHF", "GBP/USD", "USD/CHF", "USD/JPY",
     "GBP/CAD", "AUD/CAD", "AUD/USD", "USD/CAD", "GBP/JPY", "EUR/JPY",
-    "AUD/CHF", "AUD/JPY", "CAD/CHF", "CAD/JPY", "CHF/JPY", "EUR/AUD",
-    "EUR/CAD", "EUR/CHF", "EUR/GBP"
+    "AUD/CHF", "AUD/JPY", "CAD/CHF", "CAD/JPY", "CHF/JPY",
+    "EUR/AUD", "EUR/CAD", "EUR/CHF", "EUR/GBP"
 ]
 
-# === Функция получения котировок с Bitget ===
+# === Получение котировок с Bitget ===
 def get_price(symbol):
     try:
         s = symbol.replace("/", "")
-        url = f"https://api.bitget.com/api/v2/market/tickers?symbol={s}"
+        url = f"https://api.bitget.com/api/v2/market/ticker?symbol={s}_SPBL"
         r = requests.get(url, timeout=10).json()
         data = r.get("data", [])
         if not data:
             return None
-        return float(data[0]["lastPr"])
+        return float(data["lastPr"])
     except Exception:
         return None
-
-# === Исторические данные (для определения уровней) ===
-def get_ohlc(symbol, period):
-    try:
-        s = symbol.replace("/", "")
-        url = f"https://api.bitget.com/api/v2/market/candles?symbol={s}&granularity={period}"
-        r = requests.get(url, timeout=10).json()
-        candles = r.get("data", [])
-        prices = [float(c[4]) for c in candles]  # закрытия
-        return prices
-    except Exception:
-        return []
 
 # === Проверка уровней ===
-def check_levels(symbol):
-    price = get_price(symbol)
-    if not price:
-        return None
+def check_levels():
+    for pair in PAIRS:
+        price = get_price(pair)
+        if not price:
+            continue
+        # Здесь твоя логика проверки уровней максимум/минимум
+        print(f"{datetime.now().strftime('%H:%M:%S')} Проверена пара {pair}: {price}")
 
-    levels = []
-    for period, name in [(86400, "24h"), (43200, "12h"), (3600, "1h")]:
-        prices = get_ohlc(symbol, period)
-        if prices:
-            low = min(prices)
-            high = max(prices)
-            if price >= high * 0.999:  # близко к максимуму
-                levels.append((name, "MAX", high, price))
-            elif price <= low * 1.001:  # близко к минимуму
-                levels.append((name, "MIN", low, price))
-    return levels
-
-# === Отправка сигнала ===
-def send_signal(symbol, levels):
-    utc_time = datetime.utcnow() + timedelta(hours=1)
-    for name, pos, level, price in levels:
-        msg = (
-            f"⚠️ {symbol}\n"
-            f"ТФ: {name}\n"
-            f"Цена: {price:.5f}\n"
-            f"Близко к {pos} ({level:.5f})\n"
-            f"🕐 {utc_time.strftime('%H:%M')} (UTC+1)"
-        )
-        bot.send_message(TELEGRAM_CHAT_ID, msg)
-
-# === Цикл проверки сигналов ===
-async def check_signals():
+# === Команды Telegram ===
+@bot.message_handler(commands=["start"])
+def start(message):
+    bot.send_message(
+        message.chat.id,
+        "✅ Бот активен. Проверяю уровни по всем валютным парам каждые 55 секунд."
+    )
     while True:
-        for pair in PAIRS:
-            levels = check_levels(pair)
-            if levels:
-                send_signal(pair, levels)
-            await asyncio.sleep(2)  # чтобы не перегружать API
-        await asyncio.sleep(55)  # повтор цикла
-
-# === Команда /start ===
-@bot.message_handler(commands=['start'])
-def start_message(message):
-    bot.reply_to(message, "✅ Бот активен. Проверяю уровни по всем валютным парам каждые 55 секунд.")
+        check_levels()
+        time.sleep(55)
 
 # === Запуск ===
 if __name__ == "__main__":
-    bot.remove_webhook()
-    print("Удаляю вебхук перед запуском polling...")
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(check_signals())
-
+    print("Удаляю вебхук перед запуском опроса...")
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
     print("Бот запущен. Ожидает /start в Telegram.")
     bot.polling(non_stop=True, skip_pending=True)
