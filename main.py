@@ -1,283 +1,265 @@
 # main.py
+# RoxaL Trade — уровни 30м/1ч/3ч/6ч/12ч, проверка каждые 30 сек,
+# источник котировок: exchangerate.host (без ключей)
+
 import os
 import time
-import math
-import json
 import threading
-from collections import deque, defaultdict
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import requests
+from datetime import datetime, timedelta, timezone
 import telebot
 
-# ========= НАСТРОЙКИ =========
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# ---------- Настройки ----------
+CHECK_INTERVAL_SEC = 30                   # опрос каждые 30 секунд
+NEAR_THRESHOLD_PCT = 0.08                 # порог близости к уровню в %
+TIMEFRAMES = [
+    ("30m", timedelta(minutes=30)),
+    ("1h",  timedelta(hours=1)),
+    ("3h",  timedelta(hours=3)),
+    ("6h",  timedelta(hours=6)),
+    ("12h", timedelta(hours=12)),
+]
 
-# Интервал проверки (сек)
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
-# Близость к уровню (в % от цены). 0.08 = 0.08%
-NEAR_THRESH_PCT = float(os.getenv("NEAR_THRESH_PCT", "0.08"))
-# Кулдаун между сигналами по одной паре (сек)
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "300"))
-# Смещение часового пояса для показа времени
-TZ_OFFSET = os.getenv("TZ_OFFSET", "+01:00")
-
-# Список пар как на Pocket Option
+# пары (все основные с PocketOption)
 PAIRS = [
     "EUR/USD","GBP/AUD","GBP/CHF","GBP/USD","USD/CHF","USD/JPY","GBP/CAD",
     "AUD/CAD","AUD/USD","USD/CAD","GBP/JPY","EUR/JPY","AUD/CHF","AUD/JPY",
     "CAD/CHF","CAD/JPY","CHF/JPY","EUR/AUD","EUR/CAD","EUR/CHF","EUR/GBP"
 ]
 
-# Окна уровней (в минутах)
-WINDOWS_MINUTES = {
-    "30m": 30,
-    "1h": 60,
-    "3h": 180,
-    "6h": 360,
-    "12h": 720,
-}
-
-# Параметры Telegram-бота
-if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise SystemExit("❗️Не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID в переменных окружения.")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # можно указать канал/чат в переменных Railway
+if not TELEGRAM_TOKEN:
+    raise SystemExit("TELEGRAM_TOKEN не задан")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ========= ХРАНИЛКА ДАННЫХ =========
-# История цен по парам: за последние 12 часов
-price_history = defaultdict(lambda: deque())
-# Последнее состояние сигнала для анти-спама
-last_alert_state = {}
-last_alert_time = {}
+# ---------- Хранилище котировок и алертов ----------
+# history[pair] = list[(ts, price)], храним за последние 13 часов
+history = {p: [] for p in PAIRS}
 
-# ========= ВСПОМОГАТЕЛЬНОЕ =========
-def parse_tz_offset(offset_str: str) -> timezone:
-    try:
-        sign = 1 if offset_str.startswith("+") else -1
-        hh, mm = offset_str[1:].split(":")
-        return timezone(sign * timedelta(hours=int(hh), minutes=int(mm)))
-    except Exception:
-        # по умолчанию UTC+1
-        return timezone(timedelta(hours=1))
+# защита от спама: (pair, tf_name, 'max'/'min') -> last_ts
+last_alert = {}
 
-LOCAL_TZ = parse_tz_offset(TZ_OFFSET)
+HISTORY_KEEP = max(tf for _, tf in TIMEFRAMES) + timedelta(hours=1)
 
-def now_local() -> datetime:
-    return datetime.now(tz=LOCAL_TZ)
+UTC_TZ = timezone.utc
 
-def fmt_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S")
+# ---------- Утилиты времени ----------
+def now_utc():
+    return datetime.now(tz=UTC_TZ)
 
-def pair_to_base_quote(pair: str):
-    base, quote = pair.split("/")
-    return base, quote
+def format_ts_local(ts: datetime, utc_offset_hours: int = 1):
+    # Печатаем время с твоим часовым поясом (UTC+01:00 как в примерах)
+    local = ts + timedelta(hours=utc_offset_hours)
+    return local.strftime("%H:%M:%S")
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "RoxalBot/1.0"})
-
-def get_rate_exchangerate_host(pair: str) -> float | None:
-    """Нератлимитный источник: exchangerate.host (convert). Возвращает float или None."""
-    base, quote = pair_to_base_quote(pair)
-    url = f"https://api.exchangerate.host/convert?from={base}&to={quote}"
-    try:
-        r = SESSION.get(url, timeout=10)
-        if r.status_code == 200:
+# ---------- Котировки с exchangerate.host ----------
+# Для экономии запросов делаем батчи по базовым валютам
+def fetch_prices_batch():
+    """
+    Возвращает словарь {'EUR/USD': 1.0743, ...} или None при ошибке.
+    """
+    bases = set(p.split('/')[0] for p in PAIRS)
+    wants = {}
+    for base in bases:
+        symbols = []
+        for pair in PAIRS:
+            b, q = pair.split('/')
+            if b == base:
+                symbols.append(q)
+        if not symbols:
+            continue
+        url = f"https://api.exchangerate.host/latest"
+        params = {"base": base, "symbols": ",".join(symbols)}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
             data = r.json()
-            # ожидаем ключ result
-            rate = data.get("result")
-            if isinstance(rate, (int, float)) and rate > 0:
-                return float(rate)
-    except Exception as e:
-        print(f"⚠️ Ошибка запроса {pair}: {e}")
-    return None
-
-def fetch_all_prices(pairs: list[str]) -> dict[str, float | None]:
-    out = {}
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(get_rate_exchangerate_host, p): p for p in pairs}
-        for fu in as_completed(futures):
-            p = futures[fu]
-            try:
-                out[p] = fu.result()
-            except Exception as e:
-                print(f"⚠️ Ошибка потока {p}: {e}")
-                out[p] = None
-    return out
-
-def update_history(prices: dict[str, float | None]):
-    cutoff = datetime.utcnow() - timedelta(minutes=max(WINDOWS_MINUTES.values()))
-    for pair, price in prices.items():
-        if price is None:
-            continue
-        q = price_history[pair]
-        # записываем как (UTC-время, цена)
-        q.append((datetime.utcnow(), price))
-        # чистим старое
-        while q and q[0][0] < cutoff:
-            q.popleft()
-
-def window_min_max(pair: str, minutes_back: int) -> tuple[float | None, float | None]:
-    """Мин/Макс по истории за окно в минутах."""
-    since = datetime.utcnow() - timedelta(minutes=minutes_back)
-    q = price_history[pair]
-    vals = [v for t, v in q if t >= since]
-    if not vals:
-        return None, None
-    return (min(vals), max(vals))
-
-def consecutive_moves(pair: str, steps: int = 4) -> str | None:
-    """Грубая оценка направления: 4+ подряд аптиков/даунтиков по 30-сек отсчётам."""
-    q = price_history[pair]
-    if len(q) < steps + 1:
-        return None
-    # берём последние steps+1 точек
-    pts = list(q)[- (steps + 1):]
-    ups = 0
-    downs = 0
-    for i in range(1, len(pts)):
-        if pts[i][1] > pts[i-1][1]:
-            ups += 1
-        elif pts[i][1] < pts[i-1][1]:
-            downs += 1
-        else:
+            rates = data.get("rates", {})
+            for sym, val in rates.items():
+                wants[f"{base}/{sym}"] = float(val)
+        except Exception as e:
+            print(f"⚠️ Ошибка запроса {base}: {e}")
             return None
-    if ups >= steps:
-        return "4+ зелёных подряд"
-    if downs >= steps:
-        return "4+ красных подряд"
+        time.sleep(0.05)  # маленькая пауза, чтобы не долбить
+    return wants
+
+# ---------- Обновление истории ----------
+def push_price(pair: str, price: float, ts: datetime):
+    arr = history[pair]
+    arr.append((ts, price))
+    # чистим старое
+    cutoff = ts - HISTORY_KEEP
+    while arr and arr[0][0] < cutoff:
+        arr.pop(0)
+
+# ---------- Свечи M5 для streak (серии) ----------
+def get_m5_closes(pair: str, ts: datetime, bars: int = 5):
+    """
+    Собираем квази-свечи М5 из последних цен (берем последний тик внутри каждого 5-минутного ведра).
+    Возвращает список клоузов от старых к новым, длиной до bars.
+    """
+    bucket = {}
+    for t, price in history[pair]:
+        # округляем вниз к 5-минутке
+        minute = (t.minute // 5) * 5
+        t5 = t.replace(minute=minute, second=0, microsecond=0)
+        bucket[t5] = price  # берем последний попавший в ведро
+
+    keys = sorted([k for k in bucket.keys() if k <= ts])[-bars:]
+    return [bucket[k] for k in keys]
+
+def four_same_streak(pair: str, ts: datetime):
+    """
+    Есть ли подряд >=4 зеленых или >=4 красных М5 свечи (по клоузам)?
+    Возвращает ('green'|'red'|None)
+    """
+    closes = get_m5_closes(pair, ts, bars=5)
+    if len(closes) < 5:
+        return None
+    # смотрим последние 4 изменения
+    d = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    last4 = d[-4:]
+    if all(x > 0 for x in last4):
+        return "green"
+    if all(x < 0 for x in last4):
+        return "red"
     return None
 
-def pct_distance(price: float, level: float) -> float:
-    return abs(price - level) / price * 100.0
+# ---------- Поиск уровней ----------
+def compute_levels(pair: str, ts: datetime):
+    """
+    Для каждой ТФ считаем min/max за окно.
+    Возвращает dict: { '30m': (min,max), ... } где min/max = None, если данных мало.
+    """
+    arr = history[pair]
+    res = {}
+    for name, delta in TIMEFRAMES:
+        since = ts - delta
+        window = [p for (t, p) in arr if t >= since]
+        if len(window) < 3:
+            res[name] = (None, None)
+        else:
+            res[name] = (min(window), max(window))
+    return res
 
-def build_signal(pair: str, price: float) -> dict:
-    """Собираем информацию по окнам, если близко к уровням."""
-    near_max = []
-    near_min = []
-    for tag, mins in WINDOWS_MINUTES.items():
-        mn, mx = window_min_max(pair, mins)
-        if mn is None or mx is None:
+# ---------- Сигнал ----------
+def maybe_signal(pair: str, price: float, ts: datetime):
+    levels = compute_levels(pair, ts)
+    streak = four_same_streak(pair, ts)
+    signals_out = []
+
+    for tf_name, _ in TIMEFRAMES:
+        min_lvl, max_lvl = levels[tf_name]
+
+        if min_lvl is None or max_lvl is None:
             continue
-        # близость к максимуму
-        if pct_distance(price, mx) <= NEAR_THRESH_PCT:
-            near_max.append((tag, mx, pct_distance(price, mx), "↓" if price <= mx else "↑"))
-        # близость к минимуму
-        if pct_distance(price, mn) <= NEAR_THRESH_PCT:
-            near_min.append((tag, mn, pct_distance(price, mn), "↑" if price >= mn else "↓"))
 
-    if not near_max and not near_min:
-        return {}
+        dist_min = abs(price - min_lvl) / price * 100.0
+        dist_max = abs(price - max_lvl) / price * 100.0
 
-    trend_note = consecutive_moves(pair, steps=4)
+        # проверяем минимум
+        if dist_min <= NEAR_THRESHOLD_PCT:
+            key = (pair, tf_name, "min")
+            if ts.timestamp() - last_alert.get(key, 0) >= 60:  # не чаще 1 раза в минуту по одному уровню
+                last_alert[key] = ts.timestamp()
+                signals_out.append(("min", tf_name, min_lvl, dist_min))
 
-    info = {
-        "pair": pair,
-        "price": price,
-        "when": now_local(),
-        "near_max": sorted(near_max, key=lambda x: WINDOWS_MINUTES[x[0]]),
-        "near_min": sorted(near_min, key=lambda x: WINDOWS_MINUTES[x[0]]),
-        "trend": trend_note
-    }
-    return info
+        # проверяем максимум
+        if dist_max <= NEAR_THRESHOLD_PCT:
+            key = (pair, tf_name, "max")
+            if ts.timestamp() - last_alert.get(key, 0) >= 60:
+                last_alert[key] = ts.timestamp()
+                signals_out.append(("max", tf_name, max_lvl, dist_max))
 
-def format_signal_text(sig: dict) -> str:
-    pair = sig["pair"]
-    price = sig["price"]
-    tm = sig["when"]
+    if not signals_out:
+        return
+
+    # Собираем единое сообщение
     lines = []
-    lines.append("🔔 <b>СИГНАЛ</b>")
-    lines.append(f"<b>{pair}</b> | {fmt_time(tm)} (UTC{TZ_OFFSET})")
-    lines.append(f"Цена: <b>{price:.5f}</b>")
+    header = f"🔔 <b>{pair}</b> — цена близка к уровню"
+    lines.append(header)
+    lines.append(f"Цена: <b>{price:.6f}</b> (UTC {format_ts_local(ts, utc_offset_hours=1)})")
 
-    if sig["near_max"]:
-        lines.append("Близко к <b>МАКСИМУМАМ</b>:")
-        for tag, lvl, dist, arrow in sig["near_max"]:
-            lines.append(f"• {tag}: max {lvl:.5f} ({dist:.3f}% {arrow})")
-    if sig["near_min"]:
-        lines.append("Близко к <b>МИНИМУМАМ</b>:")
-        for tag, lvl, dist, arrow in sig["near_min"]:
-            lines.append(f"• {tag}: min {lvl:.5f} ({dist:.3f}% {arrow})")
+    for typ, tf_name, lvl, dist in sorted(signals_out, key=lambda x: x[1]):
+        what = "минимуму" if typ == "min" else "максимуму"
+        lines.append(f"• <b>{tf_name}</b>: {what} — уровень <b>{lvl:.6f}</b> | отклонение <b>{dist:.3f}%</b>")
 
-    if sig["trend"]:
-        lines.append(f"Условие свечей: <b>{sig['trend']}</b>")
+    if streak == "green":
+        lines.append("↗️ Серия: ≥4 <b>зелёных</b> М5 подряд")
+    elif streak == "red":
+        lines.append("↘️ Серия: ≥4 <b>красных</b> М5 подряд")
 
-    lines.append("\n— Roxal_bot")
-    return "\n".join(lines)
+    text = "\n".join(lines)
 
-def state_signature(sig: dict) -> str:
-    """Хэш состояния для анти-спама — какие окна сработали и с какой стороны."""
-    parts = []
-    for tag, *_ in sig.get("near_max", []):
-        parts.append(f"MAX:{tag}")
-    for tag, *_ in sig.get("near_min", []):
-        parts.append(f"MIN:{tag}")
-    if sig.get("trend"):
-        parts.append(f"TREND:{sig['trend']}")
-    return "|".join(parts) or "EMPTY"
-
-def send_signal(sig: dict):
-    text = format_signal_text(sig)
+    # Обычное (не-тихое) уведомление = «средний» звук Telegram
     try:
-        # Обычное уведомление (звучит «средний» системный звук Телеграма)
-        bot.send_message(CHAT_ID, text, disable_notification=False)
+        if TELEGRAM_CHAT_ID:
+            bot.send_message(TELEGRAM_CHAT_ID, text, disable_notification=False)
+        else:
+            # если чат не задан переменной — пошлём в последний /start
+            # (перепишется в обработчике /start)
+            pass
     except Exception as e:
-        print(f"⚠️ Ошибка отправки в Telegram: {e}")
+        print(f"⚠️ Ошибка отправки сигнала {pair}: {e}")
 
-def checker_loop():
-    print("🚀 Бот запущен. Ожидает /start в Telegram.")
-    # Пишем в канал, что бот активен
-    try:
-        bot.send_message(CHAT_ID, f"✅ Бот активен. Проверяю уровни каждые {CHECK_INTERVAL} сек.")
-    except Exception:
-        pass
-
+# ---------- Основной цикл ----------
+def worker_loop():
+    print("🚀 Бот запущен. Ожидаю /start в Telegram.")
     while True:
         try:
-            prices = fetch_all_prices(PAIRS)
-            update_history(prices)
+            prices = fetch_prices_batch()
+            ts = now_utc()
+            if prices is None:
+                time.sleep(CHECK_INTERVAL_SEC)
+                continue
 
-            for pair, price in prices.items():
-                if price is None:
-                    continue
-
-                sig = build_signal(pair, price)
-                if not sig:
-                    continue
-
-                stamp = state_signature(sig)
-                now_ts = time.time()
-                last_ts = last_alert_time.get(pair, 0)
-                last_state = last_alert_state.get(pair, "")
-
-                # анти-спам: кулдаун + изменения в состоянии
-                if (now_ts - last_ts) >= COOLDOWN_SEC and stamp != last_state:
-                    send_signal(sig)
-                    last_alert_time[pair] = now_ts
-                    last_alert_state[pair] = stamp
+            # записываем историю и проверяем сигналы
+            for pair, px in prices.items():
+                push_price(pair, px, ts)
+                maybe_signal(pair, px, ts)
 
         except Exception as e:
-            print(f"⚠️ Ошибка основного цикла: {e}")
-        time.sleep(CHECK_INTERVAL)
+            print(f"⚠️ Ошибка цикла: {e}")
+        time.sleep(CHECK_INTERVAL_SEC)
 
-# ========= Обработчик /start =========
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.reply_to(
-        message,
-        f"✅ Бот запущен. Проверяю уровни каждые {CHECK_INTERVAL} секунд.\n"
-        f"Порог близости к уровню: {NEAR_THRESH_PCT:.3f}%.\n"
-        f"Время в сообщениях: UTC{TZ_OFFSET}."
+# ---------- Команды бота ----------
+last_start_chat = None
+
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    global last_start_chat
+    last_start_chat = message.chat.id
+    msg = (
+        "✅ Бот запущен. Проверяю уровни каждые <b>30 секунд</b>.\n"
+        f"Порог близости к уровню: <b>{NEAR_THRESHOLD_PCT:.3f}%</b>.\n"
+        "ТФ уровней: <b>30м, 1ч, 3ч, 6ч, 12ч</b>.\n"
+        "Время в сообщениях: <b>UTC+01:00</b>.\n"
+        "Звук уведомления: <b>обычный</b> (не тихий).\n"
+        "Источник цен: <b>exchangerate.host</b>."
+    )
+    bot.send_message(message.chat.id, msg, disable_notification=False)
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    ts = now_utc()
+    filled = sum(1 for p in PAIRS if len(history[p]) > 0)
+    bot.send_message(
+        message.chat.id,
+        f"ℹ️ Статус на {format_ts_local(ts, 1)}\n"
+        f"Пары с данными: <b>{filled}/{len(PAIRS)}</b>\n"
+        f"Интервал: <b>{CHECK_INTERVAL_SEC}s</b> | Порог: <b>{NEAR_THRESHOLD_PCT:.3f}%</b>",
+        disable_notification=True
     )
 
+# ---------- Запуск ----------
 def run():
-    # отдельный поток для проверки уровней
-    t = threading.Thread(target=checker_loop, daemon=True)
+    # стартуем поток цен
+    t = threading.Thread(target=worker_loop, daemon=True)
     t.start()
-    # безопасный polling с пропуском старых апдейтов
-    bot.delete_webhook(drop_pending_updates=True)
+
+    # Long polling Telegram (skip старые)
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
 
 if __name__ == "__main__":
