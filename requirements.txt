@@ -1,3 +1,5 @@
 yfinance
 pytz
 pyTelegramBotAPI
+pandas
+requests
