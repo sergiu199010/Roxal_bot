@@ -1,17 +1,22 @@
+# main.py
+import os
 import time
+import threading
 import datetime
 import pytz
-import yfinance as yf
+from flask import Flask, request
 import telebot
-import os
+import yfinance as yf
+import pandas as pd
 
 # ==================== НАСТРОЙКИ ====================
-TELEGRAM_TOKEN = "8175185892:AAFgwnRnjW_URksiHNq7TyPzyozGYz2CjS8"
-CHECK_INTERVAL = 55  # Проверка каждые 55 секунд
-TIMEZONE = pytz.timezone("Etc/GMT-1")  # UTC+1 (GMT-1 в pytz — это +1 к UTC)
-PERCENT_THRESHOLD = 0.15  # На сколько % от минимума/максимума считается "близко"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8175185892:AAFgwnRnjW_URksiHNq7TyPzyozGYz2CjS8")
+CHECK_INTERVAL = 55  # секунд
+TIMEZONE = pytz.timezone("Etc/GMT-1")  # UTC+1 (в pytz знак обратный)
+PERCENT_THRESHOLD = 0.15  # % расстояния до min/max для сигнала (0.15 => 0.15%)
+# Примечание: если захочешь 0.2% — измени на 0.2
 
-# Список валютных пар с Pocket Option
+# Валютные пары (только валюты по твоему запросу)
 PAIRS = [
     "EUR/USD", "GBP/AUD", "GBP/CHF", "GBP/USD", "USD/CHF", "USD/JPY",
     "GBP/CAD", "AUD/CAD", "AUD/USD", "USD/CAD", "GBP/JPY", "EUR/JPY",
@@ -19,17 +24,21 @@ PAIRS = [
     "EUR/CAD", "EUR/CHF", "EUR/GBP"
 ]
 
-# Преобразуем в формат Yahoo Finance (пример: EURUSD=X)
+# Преобразование в тикеры Yahoo Finance (пример: EURUSD=X)
 YF_SYMBOLS = {p: p.replace("/", "") + "=X" for p in PAIRS}
 
-# ==================== TELEGRAM ====================
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# Файлы
 CHAT_IDS_FILE = "chat_ids.txt"
 
+# Flask + bot
+app = Flask(__name__)
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
+
+# ==================== Telegram / chat_id utils ====================
 def load_chat_ids():
     if os.path.exists(CHAT_IDS_FILE):
-        with open(CHAT_IDS_FILE, "r") as f:
+        with open(CHAT_IDS_FILE, "r", encoding="utf-8") as f:
             return [int(x.strip()) for x in f if x.strip()]
     return []
 
@@ -38,15 +47,15 @@ def save_chat_id(chat_id):
     ids = load_chat_ids()
     if chat_id not in ids:
         ids.append(chat_id)
-        with open(CHAT_IDS_FILE, "w") as f:
+        with open(CHAT_IDS_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(map(str, ids)))
 
 
 def send_message(chat_id, text):
     try:
-        bot.send_message(chat_id, text)
+        bot.send_message(chat_id, text, parse_mode="HTML")
     except Exception as e:
-        print(f"[Telegram ERROR]: {e}")
+        print(f"[Telegram ERROR] {e}")
 
 
 @bot.message_handler(commands=["start"])
@@ -58,8 +67,21 @@ def start_command(message):
     )
 
 
-# ==================== АНАЛИЗ КОТИРОВОК ====================
-def get_data(symbol, period):
+# ==================== Webhook endpoint ====================
+# Telegram будет отправлять POST на /{TELEGRAM_TOKEN}
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    try:
+        json_str = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+    except Exception as e:
+        print("Webhook processing error:", e)
+    return "", 200
+
+
+# ==================== Загрузка данных и логика уровней ====================
+def get_history(symbol: str, period: str):
     try:
         df = yf.download(
             tickers=symbol,
@@ -68,78 +90,130 @@ def get_data(symbol, period):
             progress=False,
             threads=False
         )
-        if df.empty:
-            print(f"[DATA] Пусто для {symbol}")
+        if df is None or df.empty:
+            print(f"[DATA] Пусто для {symbol} (period={period})")
             return None
-        return df
+        # убедимся, что есть нужные колонки
+        if "Close" not in df.columns or "High" not in df.columns or "Low" not in df.columns:
+            return None
+        return df.dropna()
     except Exception as e:
         print(f"[ERROR загрузки {symbol}]: {e}")
         return None
 
 
-def check_levels(pair, symbol, chat_ids):
+def pct_distance(a, b):
+    try:
+        return abs((a - b) / b) * 100
+    except Exception:
+        return 999.0
+
+
+def check_levels_and_alert(chat_ids):
+    """
+    Проходим по парам и таймфреймам, если близко к MIN или MAX — отправляем сигнал.
+    """
     tf_periods = {
         "1h": "2d",
         "12h": "5d",
         "24h": "10d"
     }
 
-    for tf, period in tf_periods.items():
-        df = get_data(symbol, period)
-        if df is None or len(df) < 10:
-            continue
+    for pair, symbol in YF_SYMBOLS.items():
+        try:
+            # Получаем последние тикеры (общее для всех TF — можно оптимизировать)
+            # но для простоты просто запрашиваем по каждому TF свой период
+            current_price = None
+            alerted = False
 
-        current = df["Close"].iloc[-1]
-        max_price = df["High"].max()
-        min_price = df["Low"].min()
+            for tf, period in tf_periods.items():
+                df = get_history(symbol, period)
+                if df is None or len(df) < 5:
+                    continue
 
-        distance_to_max = abs((max_price - current) / max_price) * 100
-        distance_to_min = abs((current - min_price) / min_price) * 100
+                current = float(df["Close"].iloc[-1])
+                max_price = float(df["High"].max())
+                min_price = float(df["Low"].min())
 
-        if distance_to_max <= PERCENT_THRESHOLD:
-            direction = "Близко к MAX"
-            target = max_price
-            distance = distance_to_max
-        elif distance_to_min <= PERCENT_THRESHOLD:
-            direction = "Близко к MIN"
-            target = min_price
-            distance = distance_to_min
-        else:
-            continue
+                dist_to_max = pct_distance(max_price, current)
+                dist_to_min = pct_distance(current, min_price)
 
-        now = datetime.datetime.now(TIMEZONE).strftime("%H:%M")
-        text = (
-            f"⚠️ {pair}\n"
-            f"ТФ: {tf}\n"
-            f"Цена: {current:.5f}\n"
-            f"{direction} ({target:.5f})\n"
-            f"Дистанция: {distance:.2f}%\n"
-            f"🕐 {now} (UTC+1)"
-        )
+                # Точность и условие
+                if dist_to_max <= PERCENT_THRESHOLD:
+                    direction = "Близко к MAX"
+                    target = max_price
+                    distance = dist_to_max
+                elif dist_to_min <= PERCENT_THRESHOLD:
+                    direction = "Близко к MIN"
+                    target = min_price
+                    distance = dist_to_min
+                else:
+                    continue
 
-        print(text)
-        for cid in chat_ids:
-            send_message(cid, text)
+                # Формируем сообщение в нужном формате
+                now = datetime.datetime.now(TIMEZONE).strftime("%H:%M")
+                text = (
+                    f"⚠️ {pair}\n"
+                    f"ТФ: {tf}\n"
+                    f"Цена: {current:.5f}\n"
+                    f"{direction} ({target:.5f})\n"
+                    f"Дистанция: {distance:.2f}%\n"
+                    f"🕐 {now} (UTC+1)"
+                )
+
+                print("ALERT:", text)
+                for cid in chat_ids:
+                    send_message(cid, text)
+
+                alerted = True
+                # Если по этой паре уже отправили сигнал для одного TF — можно продолжать и по другим TF (по желанию)
+                # здесь мы не останавливаемся, чтобы слать сигналы и для других TF тоже
+            time.sleep(0.5)  # чтобы не перегружать yfinance
+        except Exception as e:
+            print(f"[ERROR] {pair}/{symbol}: {e}")
 
 
-# ==================== ОСНОВНОЙ ЦИКЛ ====================
-def main():
-    print("=== FX Levels Bot started ===")
-    chat_ids = load_chat_ids()
-    if not chat_ids:
-        print("Нет chat.id. Отправь /start своему боту в Telegram.")
-
+# ==================== Фоновый цикл проверки ====================
+def background_loop():
+    print("Background price-check loop started.")
     while True:
         chat_ids = load_chat_ids()
-        for pair, symbol in YF_SYMBOLS.items():
-            check_levels(pair, symbol, chat_ids)
-            time.sleep(1)  # небольшая пауза между запросами
-
-        print(f"Проверка завершена — ожидание {CHECK_INTERVAL} секунд...\n")
+        if not chat_ids:
+            print("Нет chat_id. Отправь /start своему боту для регистрации.")
+        else:
+            check_levels_and_alert(chat_ids)
+        print(f"Пауза {CHECK_INTERVAL} сек...\n")
         time.sleep(CHECK_INTERVAL)
 
 
+# ==================== Старт приложения ====================
+def set_webhook():
+    webhook_url_base = os.environ.get("WEBHOOK_URL")
+    if not webhook_url_base:
+        print("ERROR: WEBHOOK_URL не установлен в переменных окружения.")
+        return False
+    full_url = webhook_url_base.rstrip("/") + f"/{TELEGRAM_TOKEN}"
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
+    time.sleep(0.5)
+    ok = bot.set_webhook(url=full_url)
+    if ok:
+        print(f"Webhook установлен: {full_url}")
+    else:
+        print("Не удалось установить webhook.")
+    return ok
+
+
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=lambda: bot.polling(none_stop=True)).start()
-    main()
+    # Устанавливаем webhook
+    set_webhook()
+
+    # Запускаем фон. цикл в отдельном потоке
+    t = threading.Thread(target=background_loop, daemon=True)
+    t.start()
+
+    # Запускаем Flask (Render будет проксировать https запросы сюда)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
