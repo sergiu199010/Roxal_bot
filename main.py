@@ -2,30 +2,30 @@ import os
 import time
 import requests
 import telebot
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # === Настройки ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EXCHANGE = os.getenv("EXCHANGE", "bitget")
 
-# Проверка токена перед запуском
+# === Проверка токена ===
 def check_token_validity(token):
+    url = f"https://api.telegram.org/bot{token}/getMe"
     try:
-        test_url = f"https://api.telegram.org/bot{token}/getMe"
-        response = requests.get(test_url, timeout=10)
-        if response.status_code == 200 and response.json().get("ok"):
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200 and r.json().get("ok"):
             print("✅ Telegram токен действителен. Продолжаю запуск.")
             return True
         else:
-            print(f"❌ Ошибка: неверный Telegram токен ({response.status_code}).")
+            print(f"❌ Ошибка: неверный Telegram токен ({r.status_code}).")
             return False
     except Exception as e:
         print(f"⚠️ Ошибка проверки токена: {e}")
         return False
 
 if not TELEGRAM_TOKEN or not check_token_validity(TELEGRAM_TOKEN):
-    print("⛔ Бот не запущен. Проверь токен TELEGRAM_TOKEN в Railway.")
+    print("⛔ Бот не запущен. Проверь TELEGRAM_TOKEN в Railway.")
     exit()
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -56,11 +56,12 @@ def check_levels():
     for pair in PAIRS:
         price = get_price(pair)
         if not price:
+            print(f"⚠️ Не удалось получить цену для {pair}")
             continue
-        # Здесь твоя логика проверки уровней максимум/минимум
+        # Здесь можно добавить логику сигналов по уровням
         print(f"{datetime.now().strftime('%H:%M:%S')} Проверена пара {pair}: {price}")
 
-# === Команды Telegram ===
+# === Команда /start ===
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(
@@ -73,10 +74,12 @@ def start(message):
 
 # === Запуск ===
 if __name__ == "__main__":
-    print("Удаляю вебхук перед запуском опроса...")
+    print("🧹 Удаляю старый вебхук перед запуском...")
     try:
-        bot.remove_webhook()
-    except Exception:
-        pass
-    print("Бот запущен. Ожидает /start в Telegram.")
+        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+        print("Ответ Telegram:", resp.json())
+    except Exception as e:
+        print("⚠️ Не удалось удалить вебхук:", e)
+
+    print("🚀 Бот запущен. Ожидает /start в Telegram.")
     bot.polling(non_stop=True, skip_pending=True)
