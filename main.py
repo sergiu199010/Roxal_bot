@@ -1,21 +1,16 @@
 import os
-import requests
 import time
 import telebot
-from datetime import datetime
-import pytz
+import requests
+from datetime import datetime, timedelta
 
-# === Настройки ===
-CHECK_INTERVAL = 60  # Проверка каждые 60 секунд
-TIMEZONE = "UTC+1"
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("API_KEY")  # ключ от APIlayer
 
-# Получаем токен и ID чата
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+bot = telebot.TeleBot(TOKEN)
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# === Валютные пары ===
+# Валютные пары
 PAIRS = [
     "EUR/USD", "GBP/AUD", "GBP/CHF", "GBP/USD", "USD/CHF", "USD/JPY",
     "GBP/CAD", "AUD/CAD", "AUD/USD", "USD/CAD", "GBP/JPY", "EUR/JPY",
@@ -23,157 +18,72 @@ PAIRS = [
     "EUR/CAD", "EUR/CHF", "EUR/GBP"
 ]
 
-# === Универсальное получение цены ===
-def get_price(symbol):
-    base, quote = symbol.split("/")
-    variants = [
-        f"{base}{quote}", f"{base}{quote}USDT", f"{base}-{quote}",
-        f"{base}-{quote}-USD", f"{base}{quote}_SPBL", f"{base}{quote}_UMCBL"
-    ]
+UTC_OFFSET = 1  # часовой пояс UTC+1
+CHECK_INTERVAL = 60  # секунд
 
-    # 1️⃣ Bitget
-    for s in variants:
-        try:
-            r = requests.get("https://api.bitget.com/api/v2/market/ticker", params={"symbol": s}, timeout=3)
-            data = r.json()
-            if r.status_code == 200 and "data" in data and isinstance(data["data"], dict):
-                price = float(data["data"].get("lastPr", 0))
-                if price > 0:
-                    return price
-        except:
-            pass
-
-    # 2️⃣ Binance
-    for s in [f"{base}{quote}", f"{base}{quote}USDT"]:
-        try:
-            r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": s}, timeout=3)
-            data = r.json()
-            if r.status_code == 200 and "price" in data:
-                return float(data["price"])
-        except:
-            pass
-
-    # 3️⃣ Bybit
-    for s in [f"{base}{quote}", f"{base}{quote}USDT"]:
-        try:
-            r = requests.get("https://api.bybit.com/v5/market/tickers", params={"category": "spot", "symbol": s}, timeout=3)
-            data = r.json()
-            if r.status_code == 200 and "result" in data and "list" in data["result"]:
-                tickers = data["result"]["list"]
-                if tickers:
-                    price = float(tickers[0].get("lastPrice", 0))
-                    if price > 0:
-                        return price
-        except:
-            pass
-
-    # 4️⃣ Coinbase
-    for s in [f"{base}-{quote}", f"{base}-{quote}-USD"]:
-        try:
-            r = requests.get(f"https://api.exchange.coinbase.com/products/{s}/ticker", timeout=3)
-            data = r.json()
-            if r.status_code == 200 and "price" in data:
-                return float(data["price"])
-        except:
-            pass
-
-    # 5️⃣ Forex API (exchangerate.host)
+# Получение котировки через APIlayer
+def get_price(pair):
     try:
-        r = requests.get(f"https://api.exchangerate.host/convert?from={base}&to={quote}", timeout=3)
+        base, quote = pair.split('/')
+        url = f"https://api.apilayer.com/exchangerates_data/convert?from={base}&to={quote}&amount=1"
+        headers = {"apikey": API_KEY}
+        r = requests.get(url, headers=headers)
         data = r.json()
-        if r.status_code == 200 and "result" in data and data["result"]:
+        if "result" in data:
             return float(data["result"])
-    except:
-        pass
-
-    print(f"⚠️ Не удалось получить цену для {symbol}")
-    return None
-
-
-# === Пример уровней ===
-def get_high_low(symbol, hours=24):
-    price = get_price(symbol)
-    if price:
-        return price * 0.995, price * 1.005
-    return None, None
-
-
-# === Проверка уровней ===
-def check_levels():
-    tz = pytz.timezone("Europe/Berlin")
-    now = datetime.now(tz)
-    for pair in PAIRS:
-        price = get_price(pair)
-        if not price:
-            continue
-
-        low_24, high_24 = get_high_low(pair, 24)
-        low_12, high_12 = get_high_low(pair, 12)
-        low_1, high_1 = get_high_low(pair, 1)
-
-        if not all([low_24, high_24, low_12, high_12, low_1, high_1]):
-            continue
-
-        near = None
-        if abs(price - high_24) / high_24 < 0.001:
-            near = f"MAX (24ч): {high_24:.5f}"
-        elif abs(price - low_24) / low_24 < 0.001:
-            near = f"MIN (24ч): {low_24:.5f}"
-        elif abs(price - high_12) / high_12 < 0.001:
-            near = f"MAX (12ч): {high_12:.5f}"
-        elif abs(price - low_12) / low_12 < 0.001:
-            near = f"MIN (12ч): {low_12:.5f}"
-        elif abs(price - high_1) / high_1 < 0.001:
-            near = f"MAX (1ч): {high_1:.5f}"
-        elif abs(price - low_1) / low_1 < 0.001:
-            near = f"MIN (1ч): {low_1:.5f}"
-
-        if near:
-            msg = (
-                f"⚠️ {pair}\n"
-                f"Цена: {price:.5f}\n"
-                f"Близко к {near}\n"
-                f"🕐 {now.strftime('%H:%M')} ({TIMEZONE})"
-            )
-            bot.send_message(TELEGRAM_CHAT_ID, msg)
-            print(msg)
-
-
-# === Проверка Telegram токена ===
-def test_token():
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe")
-        if r.status_code == 200 and r.json().get("ok"):
-            print("✅ Telegram токен действителен. Продолжаю запуск.")
-            return True
+        else:
+            print(f"⚠️ Ошибка получения цены для {pair}: {data}")
+            return None
     except Exception as e:
-        print(f"❌ Ошибка проверки токена: {e}")
-    return False
+        print(f"⚠️ Ошибка при запросе {pair}: {e}")
+        return None
 
+# Имитация уровней (в реальном варианте можно подключить исторические данные)
+def get_levels(pair):
+    price = get_price(pair)
+    if price is None:
+        return None, None, None
+    # Пример расчета уровней
+    max_lvl = price * 1.001
+    min_lvl = price * 0.999
+    return min_lvl, max_lvl, price
 
-# === Основной процесс ===
-def main():
-    if not test_token():
-        print("❌ Неверный Telegram токен.")
-        return
+def check_levels():
+    for pair in PAIRS:
+        levels = get_levels(pair)
+        if not levels:
+            continue
+        min_lvl, max_lvl, price = levels
+        dist_min = (price - min_lvl) / price * 100
+        dist_max = (max_lvl - price) / price * 100
 
-    try:
-        print("🧹 Удаляю старый вебхук...")
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-    except:
-        pass
+        if dist_min < 0.08:
+            send_signal(pair, "MIN", price, min_lvl, dist_min)
+        elif dist_max < 0.08:
+            send_signal(pair, "MAX", price, max_lvl, dist_max)
+        else:
+            print(f"⏳ {pair} | Цена: {price:.5f}")
 
-    print("🚀 Бот запущен. Ожидает /start в Telegram.")
+def send_signal(pair, level_type, price, level, distance):
+    now = datetime.utcnow() + timedelta(hours=UTC_OFFSET)
+    msg = (
+        f"⚠️ {pair}\n"
+        f"ТФ: 1h\n"
+        f"Цена: {price:.5f}\n"
+        f"Близко к {level_type} ({level:.5f})\n"
+        f"Дистанция: {distance:.2f}%\n"
+        f"🕐 {now.strftime('%H:%M')} (UTC+{UTC_OFFSET})"
+    )
+    bot.send_message(CHAT_ID, msg)
+    print(msg)
 
-    @bot.message_handler(commands=["start"])
-    def start(message):
-        bot.reply_to(message, "✅ Бот активен. Проверяю уровни по всем валютным парам каждые 60 секунд.")
-        while True:
-            check_levels()
-            time.sleep(CHECK_INTERVAL)
-
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
-
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.send_message(message.chat.id, f"✅ Бот активен. Проверяю уровни по всем валютным парам каждые {CHECK_INTERVAL} секунд.")
+    while True:
+        check_levels()
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Бот запущен. Ожидает /start в Telegram.")
+    bot.infinity_polling()
