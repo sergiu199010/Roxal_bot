@@ -2,14 +2,14 @@ import os
 import requests
 import time
 import telebot
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
 # === Настройки ===
-CHECK_INTERVAL = 55  # проверка каждые 55 секунд
+CHECK_INTERVAL = 60  # проверка каждые 60 секунд
 TIMEZONE = "UTC+1"
 
-# Получаем токен и ID канала из переменных окружения Railway
+# Получаем токен и ID чата из Railway Environment Variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -23,38 +23,58 @@ PAIRS = [
     "EUR/CAD", "EUR/CHF", "EUR/GBP"
 ]
 
-# === Получение цены с Bitget ===
+# === Получение цены с 3 источников ===
 def get_price(symbol):
-    """Пытается получить цену в разных форматах символа (EUR/USD, EURUSD, EURUSDT)."""
-    base_url = "https://api.bitget.com/api/v2/market/ticker"
-    formats = [
-        symbol.replace("/", ""),         # EURUSD
-        symbol.replace("/", "") + "T",   # EURUSDT (на всякий случай)
-        symbol.replace("/", "") + "USDT" # EURUSD -> EURUSDT
+    """Проверяет цену на Bitget, Binance и Coinbase"""
+    base, quote = symbol.split("/")
+    symbols_to_try = [
+        f"{base}{quote}",
+        f"{base}{quote}T",
+        f"{base}{quote}USDT",
+        f"{base}-{quote}",
+        f"{base}-{quote}-USD"
     ]
-    for fmt in formats:
+
+    # --- 1. Bitget ---
+    for s in symbols_to_try:
         try:
-            response = requests.get(base_url, params={"symbol": fmt})
-            if response.status_code == 200:
-                data = response.json()
-                if "data" in data and isinstance(data["data"], dict):
-                    return float(data["data"].get("lastPr", 0))
-        except Exception as e:
-            print(f"Ошибка получения цены для {fmt}: {e}")
+            r = requests.get("https://api.bitget.com/api/v2/market/ticker", params={"symbol": s}, timeout=3)
+            if r.status_code == 200 and "data" in r.json() and isinstance(r.json()["data"], dict):
+                return float(r.json()["data"]["lastPr"])
+        except:
+            pass
+
+    # --- 2. Binance ---
+    for s in symbols_to_try:
+        try:
+            r = requests.get(f"https://api.binance.com/api/v3/ticker/price", params={"symbol": s}, timeout=3)
+            if r.status_code == 200 and "price" in r.json():
+                return float(r.json()["price"])
+        except:
+            pass
+
+    # --- 3. Coinbase ---
+    for s in [f"{base}-{quote}", f"{base}-{quote}-USD"]:
+        try:
+            r = requests.get(f"https://api.exchange.coinbase.com/products/{s}/ticker", timeout=3)
+            if r.status_code == 200 and "price" in r.json():
+                return float(r.json()["price"])
+        except:
+            pass
+
     print(f"⚠️ Не удалось получить цену для {symbol}")
     return None
 
-# === Получение максимумов/минимумов (фиктивно для примера) ===
+# === Пример уровней (заглушка) ===
 def get_high_low(symbol, hours=24):
-    """Эмуляция данных уровней (в реальном коде здесь будет запрос к API)."""
     price = get_price(symbol)
     if price:
-        return price * 0.995, price * 1.005  # пример: мин/макс в пределах ±0.5%
+        return price * 0.995, price * 1.005
     return None, None
 
-# === Проверка и отправка сигналов ===
+# === Проверка уровней ===
 def check_levels():
-    tz = pytz.timezone("Europe/Berlin")  # для UTC+1
+    tz = pytz.timezone("Europe/Berlin")
     now = datetime.now(tz)
     for pair in PAIRS:
         price = get_price(pair)
@@ -92,24 +112,23 @@ def check_levels():
             bot.send_message(TELEGRAM_CHAT_ID, msg)
             print(msg)
 
-# === Проверка токена Telegram ===
+# === Проверка Telegram токена ===
 def test_token():
     try:
-        response = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe")
-        if response.status_code == 200 and response.json().get("ok"):
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe")
+        if r.status_code == 200 and r.json().get("ok"):
             print("✅ Telegram токен действителен. Продолжаю запуск.")
             return True
     except Exception as e:
         print(f"❌ Ошибка проверки токена: {e}")
     return False
 
-# === Основной цикл ===
+# === Основной процесс ===
 def main():
     if not test_token():
-        print("❌ Остановка: неверный Telegram токен.")
+        print("❌ Неверный Telegram токен.")
         return
 
-    # Удаляем старый вебхук (чтобы не было конфликта 409)
     try:
         print("🧹 Удаляю старый вебхук...")
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
@@ -119,9 +138,8 @@ def main():
     print("🚀 Бот запущен. Ожидает /start в Telegram.")
 
     @bot.message_handler(commands=["start"])
-    def start_message(message):
-        bot.reply_to(message, "✅ Бот активен. Проверяю уровни по всем валютным парам каждые 55 секунд.")
-
+    def start(message):
+        bot.reply_to(message, "✅ Бот активен. Проверяю уровни по всем валютным парам каждые 60 секунд.")
         while True:
             check_levels()
             time.sleep(CHECK_INTERVAL)
