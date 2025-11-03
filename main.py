@@ -7,29 +7,10 @@ from datetime import datetime, timedelta
 # === Настройки ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = 55  # секунд
-UTC_OFFSET = 1  # UTC+1
+CHECK_INTERVAL = 60  # Проверка каждые 60 сек
+UTC_OFFSET = 1       # Часовой пояс UTC+1
 
-# === Проверка токена ===
-def check_token_validity(token):
-    url = f"https://api.telegram.org/bot{token}/getMe"
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200 and r.json().get("ok"):
-            print("✅ Telegram токен действителен. Продолжаю запуск.")
-            return True
-        else:
-            print(f"❌ Ошибка токена ({r.status_code}). Проверь TELEGRAM_TOKEN.")
-            return False
-    except Exception as e:
-        print(f"⚠️ Ошибка проверки токена: {e}")
-        return False
-
-if not TELEGRAM_TOKEN or not check_token_validity(TELEGRAM_TOKEN):
-    print("⛔ Бот не запущен. Проверь TELEGRAM_TOKEN.")
-    exit()
-
-bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)  # threaded=False → один экземпляр
+bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
 # === Валютные пары ===
 PAIRS = [
@@ -39,42 +20,42 @@ PAIRS = [
     "EUR/AUD", "EUR/CAD", "EUR/CHF", "EUR/GBP"
 ]
 
-# === Получение цены (Bitget → Binance резерв) ===
+# === Получение цены ===
 def get_price(symbol):
     s = symbol.replace("/", "")
     try:
-        # Bitget
         url1 = f"https://api.bitget.com/api/v2/market/ticker?symbol={s}_SPBL"
         r1 = requests.get(url1, timeout=10)
         data = r1.json().get("data", {})
         if isinstance(data, dict) and "lastPr" in data:
             return float(data["lastPr"])
 
-        # Binance
+        # Резерв: Binance
         url2 = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
         r2 = requests.get(url2, timeout=10)
         js = r2.json()
-        if isinstance(js, dict) and "price" in js:
+        if "price" in js:
             return float(js["price"])
 
         print(f"⚠️ Не удалось получить цену для {symbol}")
         return None
     except Exception as e:
         print(f"⚠️ Ошибка получения цены для {symbol}: {e}")
-        time.sleep(2)
+        time.sleep(1)
         return None
 
-# === Получение максимумов и минимумов ===
-def get_candles(symbol, interval, limit=200):
+# === Получение максимумов/минимумов ===
+def get_candles(symbol, interval, limit=100):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={interval}&limit={limit}"
-        response = requests.get(url, timeout=10)
-        data = response.json()
+        s = symbol.replace("/", "")
+        url = f"https://api.binance.com/api/v3/klines?symbol={s}&interval={interval}&limit={limit}"
+        r = requests.get(url, timeout=10)
+        data = r.json()
         highs = [float(c[2]) for c in data]
         lows = [float(c[3]) for c in data]
         return max(highs), min(lows)
     except Exception as e:
-        print(f"⚠️ Ошибка свечей для {symbol} ({interval}): {e}")
+        print(f"⚠️ Ошибка свечей для {symbol}: {e}")
         time.sleep(1)
         return None, None
 
@@ -104,40 +85,36 @@ def check_levels():
             dist_low = (price - low) / price * 100
 
             if 0 < dist_high <= 0.1:
-                msg = (
-                    f"⚠️ {pair}\nТФ: {tf}\nЦена: {price}\n"
-                    f"Близко к MAX ({high})\nДистанция: {dist_high:.2f}%\n🕐 {time_now}"
+                bot.send_message(
+                    TELEGRAM_CHAT_ID,
+                    f"📈 {pair} близко к максимуму {tf}\n"
+                    f"Цена: {price}\nMAX: {high}\nДистанция: {dist_high:.3f}%\n🕐 {time_now}"
                 )
-                bot.send_message(TELEGRAM_CHAT_ID, msg)
 
             elif 0 < dist_low <= 0.1:
-                msg = (
-                    f"⚠️ {pair}\nТФ: {tf}\nЦена: {price}\n"
-                    f"Близко к MIN ({low})\nДистанция: {dist_low:.2f}%\n🕐 {time_now}"
+                bot.send_message(
+                    TELEGRAM_CHAT_ID,
+                    f"📉 {pair} близко к минимуму {tf}\n"
+                    f"Цена: {price}\nMIN: {low}\nДистанция: {dist_low:.3f}%\n🕐 {time_now}"
                 )
-                bot.send_message(TELEGRAM_CHAT_ID, msg)
 
         print(f"✅ Проверена пара {pair}: {price}")
+        time.sleep(2)  # Пауза между запросами, чтобы Binance не блокировал
 
 # === Команда /start ===
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(
-        message.chat.id,
-        f"✅ Бот активен. Проверяю уровни по всем валютным парам каждые {CHECK_INTERVAL} секунд."
-    )
+    bot.send_message(message.chat.id, "✅ Бот запущен и проверяет уровни каждые 60 секунд.")
     while True:
         check_levels()
         time.sleep(CHECK_INTERVAL)
 
 # === Запуск ===
 if __name__ == "__main__":
-    print("🧹 Удаляю старый вебхук перед запуском...")
     try:
-        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
-        print("Ответ Telegram:", resp.json())
-    except Exception as e:
-        print("⚠️ Не удалось удалить вебхук:", e)
-
+        print("🧹 Удаляю старый вебхук...")
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+    except:
+        pass
     print("🚀 Бот запущен. Ожидает /start в Telegram.")
     bot.polling(non_stop=True, skip_pending=True)
