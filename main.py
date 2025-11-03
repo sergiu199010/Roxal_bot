@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = 55  # секунд
-UTC_OFFSET = 1  # часовой пояс UTC+1
+UTC_OFFSET = 1  # UTC+1
 
 # === Проверка токена ===
 def check_token_validity(token):
@@ -29,7 +29,7 @@ if not TELEGRAM_TOKEN or not check_token_validity(TELEGRAM_TOKEN):
     print("⛔ Бот не запущен. Проверь TELEGRAM_TOKEN.")
     exit()
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)  # threaded=False → один экземпляр
 
 # === Валютные пары ===
 PAIRS = [
@@ -41,36 +41,41 @@ PAIRS = [
 
 # === Получение цены (Bitget → Binance резерв) ===
 def get_price(symbol):
+    s = symbol.replace("/", "")
     try:
-        s = symbol.replace("/", "")
+        # Bitget
         url1 = f"https://api.bitget.com/api/v2/market/ticker?symbol={s}_SPBL"
-        r1 = requests.get(url1, timeout=10).json()
-        data1 = r1.get("data", [])
-        if data1 and isinstance(data1, dict) and "lastPr" in data1:
-            return float(data1["lastPr"])
+        r1 = requests.get(url1, timeout=10)
+        data = r1.json().get("data", {})
+        if isinstance(data, dict) and "lastPr" in data:
+            return float(data["lastPr"])
 
-        # Резерв: Binance
-        url2 = f"https://api.binance.com/api/v3/ticker/price?symbol={s.replace('/', '')}"
-        r2 = requests.get(url2, timeout=10).json()
-        if "price" in r2:
-            return float(r2["price"])
+        # Binance
+        url2 = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
+        r2 = requests.get(url2, timeout=10)
+        js = r2.json()
+        if isinstance(js, dict) and "price" in js:
+            return float(js["price"])
 
         print(f"⚠️ Не удалось получить цену для {symbol}")
         return None
     except Exception as e:
         print(f"⚠️ Ошибка получения цены для {symbol}: {e}")
+        time.sleep(2)
         return None
 
 # === Получение максимумов и минимумов ===
 def get_candles(symbol, interval, limit=200):
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol.replace('/', '')}&interval={interval}&limit={limit}"
-        data = requests.get(url, timeout=10).json()
+        response = requests.get(url, timeout=10)
+        data = response.json()
         highs = [float(c[2]) for c in data]
         lows = [float(c[3]) for c in data]
         return max(highs), min(lows)
     except Exception as e:
         print(f"⚠️ Ошибка свечей для {symbol} ({interval}): {e}")
+        time.sleep(1)
         return None, None
 
 # === Проверка уровней ===
@@ -81,7 +86,7 @@ def check_levels():
             continue
 
         max_1h, min_1h = get_candles(pair, "1h")
-        max_12h, min_12h = get_candles(pair, "12h")
+        max_12h, min_12h = get_candles(pair, "4h")
         max_24h, min_24h = get_candles(pair, "1d")
 
         if not all([max_1h, min_1h, max_12h, min_12h, max_24h, min_24h]):
@@ -90,7 +95,6 @@ def check_levels():
         utc_now = datetime.utcnow() + timedelta(hours=UTC_OFFSET)
         time_now = utc_now.strftime("%H:%M (UTC+1)")
 
-        # Проверка близости к уровням
         for tf, high, low in [
             ("1h", max_1h, min_1h),
             ("12h", max_12h, min_12h),
@@ -100,14 +104,20 @@ def check_levels():
             dist_low = (price - low) / price * 100
 
             if 0 < dist_high <= 0.1:
-                msg = f"⚠️ {pair}\nТФ: {tf}\nЦена: {price}\nБлизко к MAX ({high})\nДистанция: {dist_high:.2f}%\n🕐 {time_now}"
+                msg = (
+                    f"⚠️ {pair}\nТФ: {tf}\nЦена: {price}\n"
+                    f"Близко к MAX ({high})\nДистанция: {dist_high:.2f}%\n🕐 {time_now}"
+                )
                 bot.send_message(TELEGRAM_CHAT_ID, msg)
 
             elif 0 < dist_low <= 0.1:
-                msg = f"⚠️ {pair}\nТФ: {tf}\nЦена: {price}\nБлизко к MIN ({low})\nДистанция: {dist_low:.2f}%\n🕐 {time_now}"
+                msg = (
+                    f"⚠️ {pair}\nТФ: {tf}\nЦена: {price}\n"
+                    f"Близко к MIN ({low})\nДистанция: {dist_low:.2f}%\n🕐 {time_now}"
+                )
                 bot.send_message(TELEGRAM_CHAT_ID, msg)
 
-        print(f"Проверена пара {pair}: {price}")
+        print(f"✅ Проверена пара {pair}: {price}")
 
 # === Команда /start ===
 @bot.message_handler(commands=["start"])
